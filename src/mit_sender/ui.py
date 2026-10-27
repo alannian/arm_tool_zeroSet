@@ -49,6 +49,8 @@ from mit_sender.damiao import (
     MotorFeedback,
     MotorSpec,
     default_motor_specs,
+    is_can_interface_name,
+    list_available_can_interfaces,
 )
 from mit_sender.settings_store import SavedAppState, SettingsStore
 from mit_sender.workers import CanSetupWorker, FeedbackMonitorWorker, MotorActionWorker
@@ -88,9 +90,11 @@ QLineEdit {
     background: #FFFFFF;
     border: 1px solid #C9D3E1;
     border-radius: 6px;
+    color: #172033;
     min-height: 30px;
     padding: 2px 8px;
     selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
 }
 QLineEdit:focus {
     border: 1px solid #2563EB;
@@ -103,11 +107,34 @@ QComboBox {
     background: #FFFFFF;
     border: 1px solid #C9D3E1;
     border-radius: 6px;
+    color: #172033;
     min-height: 30px;
     padding: 2px 8px;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
 }
 QComboBox:focus {
     border: 1px solid #2563EB;
+}
+QComboBox:disabled {
+    background: #EDF1F6;
+    color: #8A96A8;
+}
+QComboBox QAbstractItemView {
+    background: #FFFFFF;
+    border: 1px solid #C9D3E1;
+    color: #172033;
+    outline: 0;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 28px;
+    padding: 4px 8px;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: #2563EB;
+    color: #FFFFFF;
 }
 QPushButton {
     background: #FFFFFF;
@@ -364,6 +391,7 @@ class MitSenderWindow(QMainWindow):
         super().__init__()
         self.settings_store = settings_store or SettingsStore()
         self.motor_specs = default_motor_specs()
+        self.available_interfaces = self._available_can_interfaces()
         self.saved_state = self.settings_store.load(self.motor_specs)
         self.enabled_motor_ids: set[int] = set()
         self.worker_thread: QThread | None = None
@@ -377,11 +405,17 @@ class MitSenderWindow(QMainWindow):
         self.feedback_motor_specs = list(self.motor_specs)
         self._single_motor_discovery_active = False
         self._single_motor_locked_feedback_id: int | None = None
+        self._feedback_stopping = False
+        self._pending_debug_action: tuple[str, TransportSettings, list[SelectedMotorCommand], SingleMotorDebugCommand] | None = None
+        self._busy = False
+        self._closing = False
         self.checkboxes: dict[int, QCheckBox] = {}
         self.inputs: dict[int, dict[str, QLineEdit]] = {}
         self.uniform_inputs: dict[str, QLineEdit] = {}
         self._last_auto_feedback_id = "0x011"
         self._manual_feedback_id_override = False
+        self._last_current_feedback_id = "0x011"
+        self._manual_current_feedback_override = False
         self._loading_state = True
 
         self.setWindowTitle("MIT 电机一键发送")
@@ -389,6 +423,15 @@ class MitSenderWindow(QMainWindow):
         self._build_ui()
         self._apply_saved_state()
         self._loading_state = False
+
+    def _available_can_interfaces(self) -> tuple[str, ...]:
+        detected = list_available_can_interfaces()
+        return detected or ALLOWED_INTERFACES
+
+    def _default_interface_choice(self) -> str:
+        if DEFAULT_INTERFACE in self.available_interfaces:
+            return DEFAULT_INTERFACE
+        return self.available_interfaces[0] if self.available_interfaces else DEFAULT_INTERFACE
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -458,11 +501,11 @@ class MitSenderWindow(QMainWindow):
         grid.setVerticalSpacing(6)
 
         self.interface_input = QComboBox()
-        self.interface_input.addItems(ALLOWED_INTERFACES)
-        self.interface_input.setCurrentText(DEFAULT_INTERFACE)
+        self.interface_input.addItems(self.available_interfaces)
+        self.interface_input.setCurrentText(self._default_interface_choice())
         self.interface_input.setMinimumWidth(120)
-        self.interface_input.setToolTip("SocketCAN 接口，只允许 can0 或 can1")
-        self.interface_input.currentIndexChanged.connect(lambda _index: self._save_state())
+        self.interface_input.setToolTip("启动时检测到的 SocketCAN 接口")
+        self.interface_input.currentIndexChanged.connect(self._handle_interface_changed)
         self.nominal_input = QLineEdit(str(DEFAULT_NOMINAL_BITRATE))
         self.nominal_input.setValidator(QIntValidator(1, 10_000_000, self))
         self.nominal_input.setToolTip("仲裁波特率，默认 1000000")
@@ -651,7 +694,7 @@ class MitSenderWindow(QMainWindow):
         layout.setSpacing(10)
         layout.setContentsMargins(10, 8, 10, 8)
 
-        warning = QLabel("此页用于总线上只连接一个待配置电机的场景；多电机同时在线时不建议修改 ID。")
+        warning = QLabel("同一总线可连接 7 台电机：选择电机后，只读取和标零该电机。修改地址使用“目标 ID”，请避免与其他电机地址重复。")
         warning.setObjectName("warningText")
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -660,10 +703,22 @@ class MitSenderWindow(QMainWindow):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
 
+        self.debug_motor_combo = QComboBox()
+        for spec in self.motor_specs:
+            self.debug_motor_combo.addItem(f"{spec.motor_id} 号 · CAN 0x{spec.can_id:03X}", spec.can_id)
+        self.debug_motor_combo.addItem("自定义 ID", None)
+        self.debug_motor_combo.setToolTip("选择本次读取、失能和保存零点的电机；不会修改驱动器地址")
+        self.debug_motor_combo.currentIndexChanged.connect(self._select_debug_motor)
+
         self.debug_current_can_input = QLineEdit("0x01")
         self.debug_current_can_input.setToolTip("当前电机 CAN ID，支持十六进制或十进制，范围 0x001..0x7FE")
         self.debug_current_can_input.setAlignment(Qt.AlignRight)
-        self.debug_current_can_input.textChanged.connect(self._handle_debug_input_changed)
+        self.debug_current_can_input.textChanged.connect(self._handle_current_motor_changed)
+
+        self.debug_current_mst_input = QLineEdit("0x011")
+        self.debug_current_mst_input.setAlignment(Qt.AlignRight)
+        self.debug_current_mst_input.setToolTip("当前电机实际的反馈 ID / Master ID；默认等于当前 CAN ID + 0x10，可手动修改")
+        self.debug_current_mst_input.textChanged.connect(self._handle_current_feedback_changed)
 
         self.debug_new_can_input = QLineEdit("0x01")
         self.debug_new_can_input.setToolTip("要写入的目标 CAN ID，支持十六进制或十进制，范围 0x001..0x7FE")
@@ -681,14 +736,18 @@ class MitSenderWindow(QMainWindow):
         self.debug_mode_combo.setToolTip("保存零点控制帧使用的当前模式 ID 偏移")
         self.debug_mode_combo.currentIndexChanged.connect(self._handle_debug_mode_changed)
 
-        grid.addWidget(QLabel("当前 CAN ID"), 0, 0)
-        grid.addWidget(self.debug_current_can_input, 0, 1)
-        grid.addWidget(QLabel("目标 CAN ID"), 0, 2)
-        grid.addWidget(self.debug_new_can_input, 0, 3)
-        grid.addWidget(QLabel("目标反馈 ID"), 0, 4)
-        grid.addWidget(self.debug_new_mst_input, 0, 5)
+        grid.addWidget(QLabel("标定电机"), 0, 0)
+        grid.addWidget(self.debug_motor_combo, 0, 1)
+        grid.addWidget(QLabel("当前 CAN ID"), 0, 2)
+        grid.addWidget(self.debug_current_can_input, 0, 3)
+        grid.addWidget(QLabel("当前反馈 ID"), 0, 4)
+        grid.addWidget(self.debug_current_mst_input, 0, 5)
         grid.addWidget(QLabel("当前模式"), 1, 0)
         grid.addWidget(self.debug_mode_combo, 1, 1)
+        grid.addWidget(QLabel("目标 CAN ID（改地址）"), 1, 2)
+        grid.addWidget(self.debug_new_can_input, 1, 3)
+        grid.addWidget(QLabel("目标反馈 ID（改地址）"), 1, 4)
+        grid.addWidget(self.debug_new_mst_input, 1, 5)
         grid.setColumnStretch(6, 1)
         layout.addLayout(grid)
 
@@ -750,8 +809,12 @@ class MitSenderWindow(QMainWindow):
         self.debug_feedback_torque_label = self._readonly_label("-")
         self.debug_feedback_time_label = self._readonly_label("-")
         self.debug_read_button = QPushButton("开启读取数据")
-        self.debug_read_button.setToolTip("主动扫描 1-7：挨个使能并发送全 0 MIT 帧，读到反馈后直接启动 Rerun")
+        self.debug_read_button.setToolTip("只使能当前 CAN ID 对应的电机并发送全 0 MIT 帧，只接收当前反馈 ID；同时打开 Rerun")
         self.debug_read_button.clicked.connect(self._start_debug_tab_feedback_monitor)
+        self.debug_stop_button = QPushButton("停止读取")
+        self.debug_stop_button.setEnabled(False)
+        self.debug_stop_button.setToolTip("停止发送和读取；停止读取不会自动失能电机")
+        self.debug_stop_button.clicked.connect(self._stop_feedback_monitor)
 
         grid.addWidget(QLabel("读取状态"), 0, 0)
         grid.addWidget(self.debug_feedback_status_label, 0, 1)
@@ -763,7 +826,10 @@ class MitSenderWindow(QMainWindow):
         grid.addWidget(self.debug_feedback_torque_label, 1, 1)
         grid.addWidget(QLabel("反馈时间"), 1, 2)
         grid.addWidget(self.debug_feedback_time_label, 1, 3)
-        grid.addWidget(self.debug_read_button, 1, 5)
+        read_actions = QHBoxLayout()
+        read_actions.addWidget(self.debug_read_button)
+        read_actions.addWidget(self.debug_stop_button)
+        grid.addLayout(read_actions, 1, 5)
         grid.setColumnStretch(6, 1)
         return group
 
@@ -774,6 +840,11 @@ class MitSenderWindow(QMainWindow):
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
+
+        self.debug_disable_button = QPushButton("失能所选电机")
+        self.debug_disable_button.setToolTip("先停止读取，再只向当前 CAN ID 发送失能指令；不会修改零点、模式或 ID")
+        self.debug_disable_button.clicked.connect(lambda: self._start_action("debug_disable"))
+        layout.addWidget(self.debug_disable_button)
 
         self.debug_zero_button = QPushButton("保存当前位置为零点")
         self.debug_zero_button.clicked.connect(lambda: self._start_action("debug_zero"))
@@ -805,7 +876,12 @@ class MitSenderWindow(QMainWindow):
 
     def _apply_saved_state(self) -> None:
         state = self.saved_state
-        self.interface_input.setCurrentText(state.transport.interface if state.transport.interface in ALLOWED_INTERFACES else DEFAULT_INTERFACE)
+        interface = (
+            state.transport.interface
+            if state.transport.interface in self.available_interfaces
+            else self._default_interface_choice()
+        )
+        self.interface_input.setCurrentText(interface)
         self.nominal_input.setText(str(state.transport.nominal_bitrate))
         self.data_input.setText(str(state.transport.data_bitrate))
         self.configure_checkbox.setChecked(state.transport.configure_interface)
@@ -820,6 +896,10 @@ class MitSenderWindow(QMainWindow):
             line_edit.setText(str(state.uniform_command.get(field, MIT_COMMAND_DEFAULTS[field])))
 
         self.debug_current_can_input.setText(self._format_can_id(state.debug_command.current_can_id))
+        self.debug_current_mst_input.setText(self._format_can_id(state.debug_command.feedback_id))
+        self._last_current_feedback_id = self._default_feedback_id_text(state.debug_command.current_can_id)
+        self._manual_current_feedback_override = state.debug_command.feedback_id != self._parse_int_text(self._last_current_feedback_id)
+        self._sync_debug_motor_combo()
         self.debug_new_can_input.setText(self._format_can_id(state.debug_command.new_can_id))
         self.debug_new_mst_input.setText(self._format_can_id(state.debug_command.new_mst_id))
         self._last_auto_feedback_id = self._default_feedback_id_text(state.debug_command.new_can_id)
@@ -842,7 +922,7 @@ class MitSenderWindow(QMainWindow):
         self._mark_valid(self.nominal_input)
         self._mark_valid(self.data_input)
         interface = self.interface_input.currentText().strip()
-        if interface not in ALLOWED_INTERFACES:
+        if not is_can_interface_name(interface):
             raise ValueError("CAN 接口不能为空")
         return TransportSettings(
             interface=interface,
@@ -902,6 +982,7 @@ class MitSenderWindow(QMainWindow):
             current_mode_offset=int(self.debug_mode_combo.currentData()),
             new_can_id=new_can_id,
             new_mst_id=new_mst_id,
+            current_mst_id=self._read_can_id(self.debug_current_mst_input, "当前反馈 ID"),
         )
 
     def _read_float(self, line_edit: QLineEdit, label: str) -> float:
@@ -1015,6 +1096,9 @@ class MitSenderWindow(QMainWindow):
         self.feedback_dialog.activateWindow()
 
     def _start_current_tab_feedback_monitor(self) -> None:
+        if self.tabs.currentIndex() == 1:
+            self._start_debug_tab_feedback_monitor()
+            return
         try:
             specs = self._feedback_specs_for_current_tab()
         except Exception as exc:  # noqa: BLE001 - input errors should be visible.
@@ -1023,7 +1107,14 @@ class MitSenderWindow(QMainWindow):
         self._start_feedback_monitor(specs)
 
     def _start_debug_tab_feedback_monitor(self) -> None:
-        self._start_single_motor_discovery(self._debug_discovery_specs())
+        try:
+            specs = self._debug_discovery_specs()
+            if int(self.debug_mode_combo.currentData()) != 0:
+                raise ValueError("定向读取需要 MIT 模式。请先写入 MIT 模式，再开启读取；其他模式仍可单独保存零点。")
+        except ValueError as exc:
+            QMessageBox.warning(self, "输入错误", str(exc))
+            return
+        self._start_single_motor_discovery(specs)
 
     def _feedback_specs_for_current_tab(self) -> list[MotorSpec]:
         if self.tabs.currentIndex() == 0:
@@ -1039,41 +1130,13 @@ class MitSenderWindow(QMainWindow):
         return self._debug_discovery_specs()
 
     def _debug_discovery_specs(self) -> list[MotorSpec]:
-        specs = [
-            MotorSpec(
-                motor_id=index,
-                can_id=index,
-                mst_id=index + DEFAULT_DEBUG_FEEDBACK_OFFSET,
-                motor_type=self.motor_specs[0].motor_type,
-            )
-            for index in range(1, 8)
-        ]
-        try:
-            debug_command = self._debug_command()
-        except Exception:
-            return specs
-
-        extra_pairs = (
-            (debug_command.current_can_id, debug_command.current_can_id + DEFAULT_DEBUG_FEEDBACK_OFFSET),
-            (debug_command.new_can_id, debug_command.new_mst_id),
-        )
-        seen = {(spec.can_id, spec.mst_id) for spec in specs}
-        for can_id, mst_id in extra_pairs:
-            if mst_id < 0x001 or mst_id > 0x7FE or (can_id, mst_id) in seen:
-                continue
-            specs.append(
-                MotorSpec(
-                    motor_id=len(specs) + 1,
-                    can_id=can_id,
-                    mst_id=mst_id,
-                    motor_type=self.motor_specs[0].motor_type,
-                )
-            )
-            seen.add((can_id, mst_id))
-        return specs
+        can_id = self._read_can_id(self.debug_current_can_input, "当前 CAN ID")
+        feedback_id = self._read_can_id(self.debug_current_mst_input, "当前反馈 ID")
+        spec = next((item for item in self.motor_specs if item.can_id == can_id), self.motor_specs[0])
+        return [MotorSpec(motor_id=spec.motor_id, can_id=can_id, mst_id=feedback_id, motor_type=spec.motor_type)]
 
     def _start_single_motor_discovery(self, motor_specs: list[MotorSpec] | None = None) -> None:
-        if self.feedback_thread is not None:
+        if self.feedback_thread is not None or self._busy:
             return
         try:
             settings = self._settings()
@@ -1081,25 +1144,23 @@ class MitSenderWindow(QMainWindow):
             QMessageBox.warning(self, "输入错误", str(exc))
             return
         desired_specs = list(motor_specs or self._debug_discovery_specs())
+        if len(desired_specs) != 1:
+            raise ValueError("单电机页每次只能读取一个选中的电机")
         self._save_state()
+        self._feedback_stopping = False
         self.feedback_motor_specs = desired_specs
         self._single_motor_discovery_active = True
         self._single_motor_locked_feedback_id = None
-        self.debug_detected_can_label.setText("-")
-        self.debug_detected_feedback_label.setText("-")
-        self.debug_detected_state_label.setText("-")
-        self.debug_feedback_position_label.setText("-")
-        self.debug_feedback_velocity_label.setText("-")
-        self.debug_feedback_torque_label.setText("-")
-        self.debug_feedback_time_label.setText("-")
-        self.debug_feedback_status_label.setText("主动扫描 1-7 中")
-        feedback_ids = ", ".join(f"0x{spec.mst_id:03X}" for spec in desired_specs)
+        self._reset_debug_feedback_values()
+        selected = desired_specs[0]
+        self.debug_feedback_status_label.setText(f"等待 CAN 0x{selected.can_id:03X} / 反馈 0x{selected.mst_id:03X}")
         self._append_log(
-            f"单电机主动扫描: {settings.interface} bitrate={settings.nominal_bitrate} "
-            f"dbitrate={settings.data_bitrate} feedback=[{feedback_ids}]"
+            f"定向读取: {settings.interface} CAN 0x{selected.can_id:03X} / 反馈 0x{selected.mst_id:03X} "
+            f"bitrate={settings.nominal_bitrate} dbitrate={settings.data_bitrate}"
         )
         self.feedback_button.setEnabled(False)
         self.debug_read_button.setEnabled(False)
+        self.debug_stop_button.setEnabled(True)
         self._set_status("读取线程启动中")
 
         self.feedback_thread = QThread(self)
@@ -1121,15 +1182,7 @@ class MitSenderWindow(QMainWindow):
         self.feedback_thread.start()
 
     def _debug_feedback_specs(self) -> list[MotorSpec]:
-        debug_command = self._debug_command()
-        return [
-            MotorSpec(
-                motor_id=1,
-                can_id=debug_command.new_can_id,
-                mst_id=debug_command.new_mst_id,
-                motor_type=self.motor_specs[0].motor_type,
-            )
-        ]
+        return self._debug_discovery_specs()
 
     def _start_feedback_monitor(self, motor_specs: list[MotorSpec] | None = None) -> None:
         if self.feedback_thread is not None:
@@ -1140,6 +1193,7 @@ class MitSenderWindow(QMainWindow):
             QMessageBox.warning(self, "输入错误", str(exc))
             return
         desired_specs = list(motor_specs or self.feedback_motor_specs or self.motor_specs)
+        self._feedback_stopping = False
         self._save_state()
         feedback_ids = ", ".join(f"0x{spec.mst_id:03X}" for spec in desired_specs)
         self._append_log(
@@ -1152,6 +1206,7 @@ class MitSenderWindow(QMainWindow):
         self.feedback_dialog.set_status("正在启动 Rerun...")
         self.feedback_button.setEnabled(False)
         self.debug_read_button.setEnabled(False)
+        self.debug_stop_button.setEnabled(True)
         self.debug_feedback_status_label.setText("启动中")
         self._set_status("读取数据中")
 
@@ -1169,23 +1224,33 @@ class MitSenderWindow(QMainWindow):
         self.feedback_thread.start()
 
     def _stop_feedback_monitor(self) -> None:
+        if self.feedback_thread is None or self._feedback_stopping:
+            return
+        self._feedback_stopping = True
         if self.feedback_worker is not None:
             self.feedback_worker.stop()
+        self.debug_stop_button.setEnabled(False)
+        self.debug_feedback_status_label.setText("正在停止读取…")
         if self.feedback_dialog is not None:
             self.feedback_dialog.set_status("正在停止...")
 
     def _handle_feedback_frame(self, feedback: MotorFeedback, elapsed_seconds: float, frame_count: int) -> None:
+        if self._feedback_stopping or self._closing or (self.feedback_thread is None and not self._single_motor_discovery_active):
+            return
         if self.feedback_dialog is not None:
             self.feedback_dialog.update_feedback(feedback, elapsed_seconds, frame_count)
         self._handle_single_motor_discovery_frame(feedback)
         self._update_debug_feedback_values(feedback, elapsed_seconds)
 
     def _set_feedback_status(self, status: str) -> None:
+        if self._feedback_stopping or self._closing:
+            return
         if self.feedback_dialog is not None:
             self.feedback_dialog.set_status(status)
         if self._single_motor_discovery_active and self._single_motor_locked_feedback_id is None:
-            self._set_status("主动扫描 1-7 中")
-            self.debug_feedback_status_label.setText("主动扫描 1-7 中")
+            spec = self.feedback_motor_specs[0]
+            self._set_status("等待所选电机反馈")
+            self.debug_feedback_status_label.setText(f"等待 CAN 0x{spec.can_id:03X} / 反馈 0x{spec.mst_id:03X}")
             self._append_log(str(status))
             return
         self._set_status("读取数据中" if "正在读取" in str(status) else status)
@@ -1193,6 +1258,8 @@ class MitSenderWindow(QMainWindow):
         self._append_log(str(status))
 
     def _fail_feedback_monitor(self, message: str) -> None:
+        if self._feedback_stopping or self._closing:
+            return
         if self.feedback_dialog is not None:
             self.feedback_dialog.set_status(f"失败: {message}")
             self.feedback_dialog.set_running(False)
@@ -1205,20 +1272,26 @@ class MitSenderWindow(QMainWindow):
     def _clear_feedback_worker(self) -> None:
         self.feedback_thread = None
         self.feedback_worker = None
+        self._feedback_stopping = False
         self._single_motor_discovery_active = False
-        self.feedback_button.setEnabled(True)
-        self.debug_read_button.setEnabled(True)
+        self.feedback_button.setEnabled(not self._busy)
+        self.debug_read_button.setEnabled(not self._busy)
+        self.debug_stop_button.setEnabled(False)
         self._set_status("就绪")
         if self.debug_feedback_status_label.text() != "读取失败":
             self.debug_feedback_status_label.setText("未读取")
         if self.feedback_dialog is not None:
             self.feedback_dialog.set_running(False)
+        pending = self._pending_debug_action
+        self._pending_debug_action = None
+        if pending is not None and not self._closing:
+            self._launch_action(*pending)
 
     def _feedback_dialog_destroyed(self) -> None:
         self.feedback_dialog = None
 
     def _start_action(self, action: str) -> None:
-        if self.worker_thread is not None:
+        if self.worker_thread is not None or self._pending_debug_action is not None:
             return
         try:
             settings = self._settings()
@@ -1235,6 +1308,21 @@ class MitSenderWindow(QMainWindow):
         self._set_busy(True)
         self._set_status(f"执行中: {self._action_label(action)}")
         self._append_log(f"开始: {self._action_label(action)}")
+        if debug_command is not None and self.feedback_thread is not None:
+            self._pending_debug_action = (action, settings, commands, debug_command)
+            self._stop_feedback_monitor()
+            self._append_log("先停止读取，避免读取指令与所选电机的调试动作交错。")
+            return
+        self._launch_action(action, settings, commands, debug_command)
+
+    def _launch_action(
+        self,
+        action: str,
+        settings: TransportSettings,
+        commands: list[SelectedMotorCommand],
+        debug_command: SingleMotorDebugCommand | None,
+    ) -> None:
+        self._set_status(f"执行中: {self._action_label(action)}")
         self.worker_thread = QThread(self)
         self.worker = MotorActionWorker(action, settings, commands, debug_command=debug_command)
         self.worker.moveToThread(self.worker_thread)
@@ -1263,13 +1351,20 @@ class MitSenderWindow(QMainWindow):
                 self.enabled_motor_ids.difference_update(motor_ids)
             elif action in {"send", "send_uniform"}:
                 self.enabled_motor_ids.update(motor_ids)
+            elif action == "debug_disable":
+                for spec in self.motor_specs:
+                    if spec.can_id == self._debug_command().current_can_id:
+                        self.enabled_motor_ids.discard(spec.motor_id)
             self._sync_enable_button()
             self._set_status("完成")
             self._append_log(f"完成: {message}")
-            if action in {"debug_zero", "debug_set_mit", "debug_set_ids", "debug_configure"}:
+            if action in {"debug_zero", "debug_disable", "debug_set_mit", "debug_set_ids", "debug_configure"}:
                 if action in {"debug_set_ids", "debug_configure"}:
                     self._apply_successful_id_change()
                     self._stop_feedback_monitor()
+                if action in {"debug_set_mit", "debug_configure"}:
+                    self._set_debug_mode_offset(0)
+                self._reset_debug_feedback_values()
                 self.debug_feedback_status_label.setText("操作完成，点击开启读取数据")
                 self._append_log("调试动作已完成；如需查看反馈，请点击单电机页的“开启读取数据”。")
             return
@@ -1283,6 +1378,12 @@ class MitSenderWindow(QMainWindow):
         self._active_action_context = None
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.debug_connection_group.setEnabled(not busy)
+        self.interface_input.setEnabled(not busy)
+        self.nominal_input.setEnabled(not busy)
+        self.data_input.setEnabled(not busy)
+        self.configure_checkbox.setEnabled(not busy)
         self.toggle_enable_button.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
         self.uniform_send_button.setEnabled(not busy)
@@ -1291,6 +1392,8 @@ class MitSenderWindow(QMainWindow):
         self.start_can_button.setEnabled(not busy)
         self.feedback_button.setEnabled(not busy and self.feedback_thread is None)
         self.debug_read_button.setEnabled(not busy and self.feedback_thread is None)
+        self.debug_stop_button.setEnabled(not busy and self.feedback_thread is not None and not self._feedback_stopping)
+        self.debug_disable_button.setEnabled(not busy)
         self.debug_zero_button.setEnabled(not busy)
         self.debug_set_mit_button.setEnabled(not busy)
         self.debug_set_ids_button.setEnabled(not busy)
@@ -1329,6 +1432,7 @@ class MitSenderWindow(QMainWindow):
             "send": "一键发送",
             "send_uniform": "统一发送",
             "debug_zero": "保存当前位置为零点",
+            "debug_disable": "失能所选电机",
             "debug_set_mit": "写入 MIT 模式",
             "debug_set_ids": "设置 ID",
             "debug_configure": "失能后配置单电机",
@@ -1344,6 +1448,87 @@ class MitSenderWindow(QMainWindow):
         line_edit.setProperty("invalid", False)
         line_edit.style().unpolish(line_edit)
         line_edit.style().polish(line_edit)
+
+    def _reset_debug_feedback_values(self) -> None:
+        self._single_motor_locked_feedback_id = None
+        for label in (
+            self.debug_detected_can_label, self.debug_detected_feedback_label, self.debug_detected_state_label,
+            self.debug_feedback_position_label, self.debug_feedback_velocity_label, self.debug_feedback_torque_label,
+            self.debug_feedback_time_label,
+        ):
+            label.setText("-")
+
+    def _invalidate_debug_read(self) -> None:
+        if self._loading_state:
+            return
+        self._stop_feedback_monitor()
+        self._reset_debug_feedback_values()
+        self._set_status("已切换选择，请开启读取数据")
+        if self.feedback_thread is None:
+            self.debug_feedback_status_label.setText("未读取")
+
+    def _handle_interface_changed(self, _index: int) -> None:
+        self._invalidate_debug_read()
+        self._save_state()
+
+    def _sync_debug_motor_combo(self) -> None:
+        try:
+            can_id = self._parse_int_text(self.debug_current_can_input.text())
+        except ValueError:
+            can_id = None
+        index = self.debug_motor_combo.findData(can_id)
+        self.debug_motor_combo.blockSignals(True)
+        self.debug_motor_combo.setCurrentIndex(index if index >= 0 else self.debug_motor_combo.count() - 1)
+        self.debug_motor_combo.blockSignals(False)
+
+    def _select_debug_motor(self, _index: int) -> None:
+        can_id = self.debug_motor_combo.currentData()
+        if can_id is None:
+            self._invalidate_debug_read()
+            return
+        spec = next(item for item in self.motor_specs if item.can_id == can_id)
+        for widget, value in (
+            (self.debug_current_can_input, spec.can_id), (self.debug_current_mst_input, spec.mst_id),
+            (self.debug_new_can_input, spec.can_id), (self.debug_new_mst_input, spec.mst_id),
+        ):
+            widget.blockSignals(True)
+            widget.setText(self._format_can_id(value))
+            widget.blockSignals(False)
+            self._mark_valid(widget)
+        self._last_current_feedback_id = self._format_can_id(spec.mst_id)
+        self._manual_current_feedback_override = False
+        self._last_auto_feedback_id = self._format_can_id(spec.mst_id)
+        self._manual_feedback_id_override = False
+        self._invalidate_debug_read()
+        self._update_debug_summary()
+        self._save_state()
+
+    def _handle_current_motor_changed(self, _text: str) -> None:
+        self._sync_debug_motor_combo()
+        try:
+            can_id = self._parse_int_text(self.debug_current_can_input.text())
+        except ValueError:
+            can_id = None
+        if can_id is not None:
+            next_auto = self._default_feedback_id_text(can_id)
+            if not self._manual_current_feedback_override:
+                self.debug_current_mst_input.blockSignals(True)
+                self.debug_current_mst_input.setText(next_auto)
+                self.debug_current_mst_input.blockSignals(False)
+            self._last_current_feedback_id = next_auto
+        self._invalidate_debug_read()
+        self._update_debug_summary()
+        self._save_state()
+
+    def _handle_current_feedback_changed(self, _text: str) -> None:
+        try:
+            self._manual_current_feedback_override = (
+                self._parse_int_text(self.debug_current_mst_input.text()) != self._parse_int_text(self._last_current_feedback_id)
+            )
+        except ValueError:
+            self._manual_current_feedback_override = True
+        self._invalidate_debug_read()
+        self._save_state()
 
     def _handle_debug_input_changed(self, _text: str) -> None:
         self._sync_debug_feedback_default()
@@ -1364,6 +1549,7 @@ class MitSenderWindow(QMainWindow):
         self._save_state()
 
     def _handle_debug_mode_changed(self, _index: int) -> None:
+        self._invalidate_debug_read()
         self._update_debug_summary()
         self._save_state()
 
@@ -1376,6 +1562,12 @@ class MitSenderWindow(QMainWindow):
         self.debug_current_can_input.blockSignals(True)
         self.debug_current_can_input.setText(self._format_can_id(debug_command.new_can_id))
         self.debug_current_can_input.blockSignals(False)
+        self.debug_current_mst_input.blockSignals(True)
+        self.debug_current_mst_input.setText(self._format_can_id(debug_command.new_mst_id))
+        self.debug_current_mst_input.blockSignals(False)
+        self._last_current_feedback_id = self._default_feedback_id_text(debug_command.new_can_id)
+        self._manual_current_feedback_override = debug_command.new_mst_id != self._parse_int_text(self._last_current_feedback_id)
+        self._sync_debug_motor_combo()
         self._mark_valid(self.debug_current_can_input)
         self._append_log(f"当前 CAN ID 已更新为 {self._format_can_id(debug_command.new_can_id)}。")
         self._save_state()
@@ -1398,16 +1590,10 @@ class MitSenderWindow(QMainWindow):
 
     def _update_debug_feedback_values(self, feedback: MotorFeedback, elapsed_seconds: float) -> None:
         try:
-            debug_command = self._debug_command()
-        except Exception:
-            debug_command = None
-        expected_feedback_ids = {spec.mst_id for spec in self.feedback_motor_specs}
-        if debug_command is not None:
-            expected_feedback_ids.add(debug_command.new_mst_id)
-            expected_feedback_ids.add(debug_command.current_can_id + DEFAULT_DEBUG_FEEDBACK_OFFSET)
-        if self._single_motor_locked_feedback_id is not None:
-            expected_feedback_ids = {self._single_motor_locked_feedback_id}
-        if feedback.can_id not in expected_feedback_ids:
+            feedback_id = self._parse_int_text(self.debug_current_mst_input.text())
+        except ValueError:
+            return
+        if feedback.can_id != feedback_id:
             return
         if self._single_motor_discovery_active and self._single_motor_locked_feedback_id is not None:
             self.debug_feedback_status_label.setText(
@@ -1425,16 +1611,17 @@ class MitSenderWindow(QMainWindow):
     def _handle_single_motor_discovery_frame(self, feedback: MotorFeedback) -> None:
         if not self._single_motor_discovery_active:
             return
+        try:
+            selected = self._debug_discovery_specs()[0]
+        except ValueError:
+            return
+        if feedback.can_id != selected.mst_id or self._can_id_for_feedback(feedback) != selected.can_id:
+            return
         if self._single_motor_locked_feedback_id is not None and feedback.can_id != self._single_motor_locked_feedback_id:
             return
         if self._single_motor_locked_feedback_id is None:
             self._single_motor_locked_feedback_id = int(feedback.can_id)
             detected_can_id = self._can_id_for_feedback(feedback)
-            if 0x001 <= detected_can_id <= 0x7FE:
-                self.debug_current_can_input.blockSignals(True)
-                self.debug_current_can_input.setText(self._format_can_id(detected_can_id))
-                self.debug_current_can_input.blockSignals(False)
-                self._mark_valid(self.debug_current_can_input)
             self.debug_detected_can_label.setText(self._format_can_id(detected_can_id))
             self.debug_detected_feedback_label.setText(self._format_can_id(feedback.can_id))
             self.debug_detected_state_label.setText(str(feedback.state))
@@ -1443,7 +1630,7 @@ class MitSenderWindow(QMainWindow):
             )
             self._set_status("已锁定单电机")
             self._append_log(
-                f"单电机已锁定: CAN {self._format_can_id(detected_can_id)}, "
+                f"所选电机已连接: CAN {self._format_can_id(detected_can_id)}, "
                 f"反馈 {self._format_can_id(feedback.can_id)}"
             )
             self._save_state()
@@ -1548,6 +1735,8 @@ class MitSenderWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt supplies QCloseEvent at runtime.
+        self._closing = True
+        self._pending_debug_action = None
         self._save_state()
         self._stop_feedback_monitor()
         if self.feedback_thread is not None:

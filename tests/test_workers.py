@@ -3,9 +3,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from mit_sender.commands import TransportSettings
-from mit_sender.damiao import DM_Motor_Type, ENABLE_CMD, MotorSpec, build_control_cmd_frame, build_mit_frame
-from mit_sender.workers import CanSetupWorker, FeedbackMonitorWorker, ensure_or_configure_interface
+from mit_sender.commands import SingleMotorDebugCommand, TransportSettings
+from mit_sender.damiao import (
+    CONTROL_REPEAT, DISABLE_CMD, DM_Motor_Type, ENABLE_CMD, MotorSpec,
+    build_control_cmd_frame, build_mit_frame, build_zero_position_frame, default_motor_specs,
+)
+from mit_sender.workers import CanSetupWorker, FeedbackMonitorWorker, MotorActionWorker, ensure_or_configure_interface
 
 
 class FakeRecvTransport:
@@ -214,6 +217,55 @@ class WorkerTests(unittest.TestCase):
 
         self.assertEqual([[spec.mst_id for spec in specs] for specs in created_specs], [[0x13]])
         self.assertIsNotNone(worker.logger)
+
+    def test_selected_motor_receives_all_probes_while_other_bus_feedback_is_ignored(self) -> None:
+        for selected in default_motor_specs():
+            with self.subTest(motor=selected.motor_id):
+                packets = [
+                    (spec.mst_id, bytes([0x10 | spec.motor_id, 0x7F, 0xFF, 0x7F, 0xF7, 0xFF, 40, 50]))
+                    for spec in default_motor_specs()
+                ]
+                transport = FakeRecvTransport(packets)
+                logger = FakeFeedbackLogger()
+                worker = FeedbackMonitorWorker(
+                    TransportSettings("can5", 1_000_000, 5_000_000, False),
+                    [selected], logger, active_probe=True, lock_first_feedback_id=True,
+                    probe_interval_seconds=0.0,
+                )
+                with (
+                    patch("mit_sender.workers.ensure_or_configure_interface"),
+                    patch("mit_sender.workers.SocketCanTransport", return_value=transport),
+                ):
+                    worker.run()
+                self.assertEqual(logger.feedback_ids, [selected.mst_id])
+                self.assertEqual({can_id for can_id, _payload in transport.sent}, {selected.can_id})
+
+    def test_zero_and_disable_only_address_the_selected_motor_on_the_selected_bus(self) -> None:
+        for spec in default_motor_specs():
+            for action in ("debug_zero", "debug_disable"):
+                with self.subTest(motor=spec.motor_id, action=action):
+                    transport = FakeRecvTransport([])
+                    # Deliberately leave a different target ID: it must never select the motor for these actions.
+                    command = SingleMotorDebugCommand(spec.can_id, 0, 0x20, 0x30, spec.mst_id)
+                    worker = MotorActionWorker(
+                        action, TransportSettings("can5", 1_000_000, 5_000_000, False), [], command,
+                    )
+                    results = []
+                    worker.finished.connect(lambda ok, message: results.append(ok))
+                    with (
+                        patch("mit_sender.workers.ensure_or_configure_interface"),
+                        patch("mit_sender.workers.SocketCanTransport", return_value=transport) as transport_factory,
+                        patch("mit_sender.damiao.time.sleep"),
+                    ):
+                        worker.run()
+                    transport_factory.assert_called_once_with("can5")
+                    expected = (
+                        [build_zero_position_frame(spec.can_id)] if action == "debug_zero"
+                        else [build_control_cmd_frame(spec.can_id, DISABLE_CMD)] * CONTROL_REPEAT
+                    )
+                    self.assertEqual(transport.sent, expected)
+                    self.assertEqual(results, [True])
+                    self.assertTrue(transport.closed)
 
 
 if __name__ == "__main__":

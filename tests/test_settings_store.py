@@ -84,12 +84,23 @@ class SettingsStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.ini"
             settings = QSettings(str(path), QSettings.IniFormat)
-            settings.setValue("transport/interface", "can2")
+            settings.setValue("transport/interface", "eth0")
             settings.sync()
 
             restored = SettingsStore(QSettings(str(path), QSettings.IniFormat)).load(default_motor_specs())
 
         self.assertEqual(restored.transport.interface, "can0")
+
+    def test_restores_saved_detected_style_can_interface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.ini"
+            settings = QSettings(str(path), QSettings.IniFormat)
+            settings.setValue("transport/interface", "can4")
+            settings.sync()
+
+            restored = SettingsStore(QSettings(str(path), QSettings.IniFormat)).load(default_motor_specs())
+
+        self.assertEqual(restored.transport.interface, "can4")
 
     def test_restores_manual_debug_feedback_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

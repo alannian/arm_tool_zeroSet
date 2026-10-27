@@ -366,6 +366,9 @@ class DamiaoMitController:
         send_frame(self.transport, frame_can_id, payload)
         time.sleep(CONTROL_INTERVAL_SECONDS)
 
+    def disable_motor_raw(self, can_id: int, mode_offset: int = MIT_MODE) -> None:
+        self._send_control_raw(int(can_id), int(mode_offset), DISABLE_CMD)
+
     def set_mit_mode_raw(self, can_id: int) -> None:
         frame_can_id, payload = build_param_write_uint32_frame(int(can_id), PARAM_CTRL_MODE_RID, MIT_MODE_CODE)
         send_frame(self.transport, frame_can_id, payload)
@@ -527,6 +530,11 @@ def list_available_can_interfaces() -> tuple[str, ...]:
     return tuple(sorted(os.path.basename(path) for path in glob.glob("/sys/class/net/can*")))
 
 
+def is_can_interface_name(interface: str) -> bool:
+    text = str(interface).strip()
+    return text.startswith("can") and text[3:].isdigit()
+
+
 def format_available_can_interfaces() -> str:
     interfaces = list_available_can_interfaces()
     return "检测到: " + (", ".join(interfaces) if interfaces else "无")
@@ -594,6 +602,7 @@ __all__ = [
     "float_to_uint",
     "get_can_interface_state",
     "get_motor_limits",
+    "is_can_interface_name",
     "list_available_can_interfaces",
     "pack_canfd_frame",
     "parse_motor_type",

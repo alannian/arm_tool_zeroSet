@@ -13,11 +13,11 @@ from mit_sender.commands import (
     default_single_motor_debug_command,
 )
 from mit_sender.damiao import (
-    ALLOWED_INTERFACES,
     DEFAULT_DATA_BITRATE,
     DEFAULT_INTERFACE,
     DEFAULT_NOMINAL_BITRATE,
     MotorSpec,
+    is_can_interface_name,
 )
 
 
@@ -148,6 +148,10 @@ class SettingsStore:
             current_mode_offset=mode_offset,
             new_can_id=new_can_id,
             new_mst_id=new_mst_id,
+            current_mst_id=(
+                self._read_can_id("debug/current_mst_id", _default_feedback_id(current_can_id, defaults.new_mst_id))
+                if self._settings.contains("debug/current_mst_id") else None
+            ),
         )
 
     def _write_debug_command(self, command: SingleMotorDebugCommand) -> None:
@@ -165,6 +169,13 @@ class SettingsStore:
         self._settings.setValue("debug/current_mode_offset", mode_offset)
         self._settings.setValue("debug/new_can_id", new_can_id)
         self._settings.setValue("debug/new_mst_id", new_mst_id)
+        if command.current_mst_id is None:
+            self._settings.remove("debug/current_mst_id")
+        else:
+            self._settings.setValue(
+                "debug/current_mst_id",
+                _valid_can_id_or_default(command.current_mst_id, _default_feedback_id(current_can_id, defaults.new_mst_id)),
+            )
 
     def _read_selected_motor_ids(self, motor_specs: list[MotorSpec]) -> set[int]:
         valid_ids = {spec.motor_id for spec in motor_specs}
@@ -195,7 +206,7 @@ class SettingsStore:
 
     def _read_interface(self, key: str, default: str) -> str:
         text = self._read_text(key, default)
-        return text if text in ALLOWED_INTERFACES else default
+        return text if is_can_interface_name(text) else default
 
     def _read_int(self, key: str, default: int, *, minimum: int, maximum: int) -> int:
         value = self._settings.value(key, default)

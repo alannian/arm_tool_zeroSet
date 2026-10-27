@@ -223,14 +223,17 @@ class MotorActionWorker(QObject):
                 for command in self.commands:
                     controller.prepare_and_send_mit(command.motor_id, command.as_mit_command())
                 message = f"已发送 {len(self.commands)} 个 MIT 命令。"
-            elif self.action in {"debug_zero", "debug_set_mit", "debug_set_ids", "debug_configure"}:
+            elif self.action in {"debug_zero", "debug_disable", "debug_set_mit", "debug_set_ids", "debug_configure"}:
                 debug_command = self._require_debug_command()
                 if self.action == "debug_zero":
                     controller.save_zero_position_raw(
                         debug_command.current_can_id,
                         debug_command.current_mode_offset,
                     )
-                    message = f"已保存 0x{debug_command.current_can_id:03X} 当前零点。"
+                    message = f"已向 0x{debug_command.current_can_id:03X} 发送保存零点指令，请读取位置确认。"
+                elif self.action == "debug_disable":
+                    controller.disable_motor_raw(debug_command.current_can_id, debug_command.current_mode_offset)
+                    message = f"已向 0x{debug_command.current_can_id:03X} 发送失能指令。"
                 elif self.action == "debug_set_mit":
                     controller.set_mit_mode_persistent_raw(
                         debug_command.current_can_id,

@@ -73,6 +73,11 @@ class SingleMotorDebugCommand:
     current_mode_offset: int
     new_can_id: int
     new_mst_id: int
+    current_mst_id: int | None = None
+
+    @property
+    def feedback_id(self) -> int:
+        return self.current_mst_id if self.current_mst_id is not None else self.current_can_id + DEFAULT_DEBUG_FEEDBACK_OFFSET
 
 
 def default_single_motor_debug_command() -> SingleMotorDebugCommand:

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import sys
+
 from mit_sender.damiao import MotorFeedback, MotorSpec
 
 
@@ -56,6 +60,8 @@ class FeedbackRerunLogger:
             import rerun as rr
         except ImportError as exc:
             raise RuntimeError("未安装 rerun-sdk，请先运行: .venv/bin/python -m pip install -e .") from exc
+
+        _ensure_current_python_bin_on_path()
 
         self._rr = rr
         self._recording = rr.RecordingStream("mit_sender_feedback")
@@ -136,3 +142,21 @@ def _set_rerun_time_seconds(recording: object, timeline: str, seconds: float) ->
     set_time_seconds = getattr(recording, "set_time_seconds", None)
     if callable(set_time_seconds):
         set_time_seconds(timeline, float(seconds))
+
+
+def _ensure_current_python_bin_on_path() -> None:
+    candidate_bins = [Path(sys.prefix) / "bin", Path(sys.executable).parent]
+    for python_bin in candidate_bins:
+        rerun_executable = python_bin / "rerun"
+        if rerun_executable.exists():
+            _prepend_path_once(python_bin)
+            return
+
+
+def _prepend_path_once(path: Path) -> None:
+    path_text = str(path)
+    current_path = os.environ.get("PATH", "")
+    path_parts = [part for part in current_path.split(os.pathsep) if part]
+    if path_text in path_parts:
+        return
+    os.environ["PATH"] = os.pathsep.join([path_text, *path_parts])
